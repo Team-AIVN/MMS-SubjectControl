@@ -78,3 +78,7 @@ bin/
 *.db
 *.db-shm
 *.db-wal
+
+# Binaries left by `go build` in the component directories
+/edgerouter/edgerouter
+/router/router
