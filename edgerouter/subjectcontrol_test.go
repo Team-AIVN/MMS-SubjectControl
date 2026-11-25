@@ -50,7 +50,8 @@ type fakeSubjectControl struct {
 
 	decisionStatus int
 	decisionBody   string
-	decisions      []string // "mrn subject action" of every decision asked
+	decisions      []string        // "mrn subject action" of every decision asked
+	denied         map[string]bool // MRNs that get DENY whatever decisionBody says
 
 	allowlistStatus int
 	allowlistBody   string
@@ -75,6 +76,10 @@ func newFakeSubjectControl(t *testing.T) *fakeSubjectControl {
 			q := r.URL.Query()
 			f.decisions = append(f.decisions, q.Get("mrn")+" "+q.Get("subject")+" "+q.Get("action"))
 			w.WriteHeader(f.decisionStatus)
+			if f.denied[q.Get("mrn")] {
+				fmt.Fprint(w, `{"decision":"DENY"}`)
+				return
+			}
 			fmt.Fprint(w, f.decisionBody)
 		case "/v1/allowlist":
 			f.ifNoneMatch = append(f.ifNoneMatch, r.Header.Get("If-None-Match"))
@@ -111,6 +116,13 @@ func (f *fakeSubjectControl) asked() []string {
 
 func (f *fakeSubjectControl) control() *subjectControl {
 	return newSubjectControl(f.server.URL+"/", f.server.Client())
+}
+
+func requireRefresh(t *testing.T, sc *subjectControl, wantWait time.Duration, wantOK bool) {
+	t.Helper()
+	wait, ok := sc.refreshAllowlist(context.Background())
+	require.Equal(t, wantWait, wait)
+	require.Equal(t, wantOK, ok)
 }
 
 var knownAgent = &Agent{authenticated: true}
@@ -196,7 +208,7 @@ func TestAllowlistMatching(t *testing.T) {
 		]}`
 	})
 	sc := fake.control()
-	require.Equal(t, 10*time.Minute, sc.refreshAllowlist(context.Background()))
+	requireRefresh(t, sc, 10*time.Minute, true)
 	require.Len(t, sc.entries, 3, "the two patterns that cannot be used are skipped")
 
 	for _, tc := range []struct {
@@ -230,20 +242,19 @@ func TestAllowlistRefresh(t *testing.T) {
 	sc := fake.control()
 	now := time.Now()
 	sc.now = func() time.Time { return now }
-	ctx := context.Background()
 
 	require.False(t, sc.onAllowlist("open", actionSubscribe), "nothing is allowed before the first list arrives")
-	require.Equal(t, time.Minute, sc.refreshAllowlist(ctx))
+	requireRefresh(t, sc, time.Minute, true)
 	require.True(t, sc.onAllowlist("open", actionSubscribe))
 
 	// Unchanged: 304, the list stays and the request carried the ETag.
-	require.Equal(t, time.Minute, sc.refreshAllowlist(ctx))
+	requireRefresh(t, sc, time.Minute, true)
 	require.True(t, sc.onAllowlist("open", actionSubscribe))
 	require.Equal(t, []string{"", `"v1"`}, fake.ifNoneMatch)
 
 	// The service fails: retry soon, and keep using the list.
 	fake.set(func(f *fakeSubjectControl) { f.allowlistStatus = http.StatusServiceUnavailable })
-	require.Equal(t, allowlistRetry, sc.refreshAllowlist(ctx))
+	requireRefresh(t, sc, allowlistRetry, false)
 	now = now.Add(time.Hour)
 	require.True(t, sc.onAllowlist("open", actionSubscribe), "still inside max-age + stale-if-error")
 
@@ -255,14 +266,14 @@ func TestAllowlistRefresh(t *testing.T) {
 	fake.set(func(f *fakeSubjectControl) {
 		f.allowlistStatus, f.allowlistBody, f.allowlistETag = http.StatusOK, `{"entries":`, `"broken"`
 	})
-	require.Equal(t, allowlistRetry, sc.refreshAllowlist(ctx))
+	requireRefresh(t, sc, allowlistRetry, false)
 	require.Equal(t, `"v1"`, sc.etag)
 
 	// Back again with a changed list: replaced.
 	fake.set(func(f *fakeSubjectControl) {
 		f.allowlistBody, f.allowlistETag = `{"entries":[{"pattern":"other","actions":["PUB"]}]}`, `"v2"`
 	})
-	require.Equal(t, time.Minute, sc.refreshAllowlist(ctx))
+	requireRefresh(t, sc, time.Minute, true)
 	require.False(t, sc.onAllowlist("open", actionSubscribe))
 	require.True(t, sc.onAllowlist("other", actionPublish))
 }
@@ -271,7 +282,7 @@ func TestAllowlistIsFetchedAgainSoonAfterAFailedStart(t *testing.T) {
 	fake := newFakeSubjectControl(t)
 	sc := fake.control()
 	fake.server.Close()
-	require.Equal(t, allowlistRetry, sc.refreshAllowlist(context.Background()))
+	requireRefresh(t, sc, allowlistRetry, false)
 	require.Less(t, allowlistRetry, defaultAllowlistMaxAge)
 }
 
@@ -551,4 +562,189 @@ func TestWithoutSubjectControlNothingChanges(t *testing.T) {
 	require.NotNil(t, agent.forwarded())
 	require.Equal(t, mmtp.ResponseEnum_GOOD, agent.request(t, agent.sendMessage(t, testSubject)))
 	require.NotNil(t, agent.forwarded())
+}
+
+// The tests below are about subscriptions that already exist.
+
+// heldSubscriptions builds an Edge Router holding the given subject subscriptions, one Agent per MRN.
+func heldSubscriptions(t *testing.T, subject string, mrns ...string) (*EdgeRouter, []*Agent) {
+	t.Helper()
+	er := &EdgeRouter{
+		subscriptions: map[string]*Subscription{}, subMu: &sync.RWMutex{}, store: persistence.NewMemoryStore(),
+		outgoingChannel: make(chan *mmtp.MmtpMessage, 8),
+	}
+	agents := make([]*Agent, 0, len(mrns))
+	for _, mrn := range mrns {
+		agent := &Agent{agentUuid: uuid.NewString()}
+		agent.ID, agent.Mrn = agent.agentUuid, mrn
+		require.NoError(t, er.store.UpsertSession(context.Background(), persistence.Session{ID: agent.ID, Kind: persistence.SessionKindAgent, MRN: mrn}, uuid.NewString()))
+		require.NoError(t, er.store.Subscribe(context.Background(), agent.ID, subject))
+		sub := er.subscriptions[subject]
+		if sub == nil {
+			sub = NewSubscription(subject)
+			er.subscriptions[subject] = sub
+		}
+		sub.AddSubscriber(agent)
+		agents = append(agents, agent)
+	}
+	return er, agents
+}
+
+func (er *EdgeRouter) subscribers(subject string) int {
+	er.subMu.RLock()
+	defer er.subMu.RUnlock()
+	if sub := er.subscriptions[subject]; sub != nil {
+		return len(sub.SnapshotSubscribers())
+	}
+	return 0
+}
+
+func requireUpstreamUnsubscribe(t *testing.T, er *EdgeRouter, subject string) {
+	t.Helper()
+	select {
+	case msg := <-er.outgoingChannel:
+		require.Equal(t, mmtp.ProtocolMessageType_UNSUBSCRIBE_MESSAGE, msg.GetProtocolMessage().GetProtocolMsgType())
+		require.Equal(t, subject, msg.GetProtocolMessage().GetUnsubscribeMessage().GetSubject())
+	default:
+		t.Fatal("the Edge Router did not unsubscribe at the Router")
+	}
+}
+
+func TestRecheckDropsOnlyWhatIsDenied(t *testing.T) {
+	const alice, bob = "urn:mrn:mcp:entity:idp1:org1:alice", "urn:mrn:mcp:entity:idp1:org1:bob"
+	fake := newFakeSubjectControl(t)
+	fake.set(func(f *fakeSubjectControl) { f.decisionBody = `{"decision":"ALLOW"}` })
+	useSubjectControl(t, fake)
+	er, agents := heldSubscriptions(t, testSubject, alice, bob)
+	ctx := context.Background()
+
+	er.recheckSubscriptions(ctx)
+	require.Equal(t, 2, er.subscribers(testSubject), "both are still allowed")
+	require.ElementsMatch(t, []string{alice + " " + testSubject + " SUB", bob + " " + testSubject + " SUB"}, fake.asked())
+
+	// Alice's permission is revoked: only hers goes, and the Router subscription stays for Bob.
+	fake.set(func(f *fakeSubjectControl) { f.denied = map[string]bool{alice: true} })
+	er.recheckSubscriptions(ctx)
+	require.Equal(t, 1, er.subscribers(testSubject))
+	stored, err := er.store.Subscriptions(ctx, agents[0].ID)
+	require.NoError(t, err)
+	require.Empty(t, stored, "the dropped subscription must not come back after a restart")
+	stored, err = er.store.Subscriptions(ctx, agents[1].ID)
+	require.NoError(t, err)
+	require.Equal(t, []string{testSubject}, stored)
+	require.Empty(t, er.outgoingChannel)
+
+	// Bob's goes too: now the Edge Router unsubscribes at the Router.
+	fake.set(func(f *fakeSubjectControl) { f.denied[bob] = true })
+	er.recheckSubscriptions(ctx)
+	require.Equal(t, 0, er.subscribers(testSubject))
+	require.NotContains(t, er.subscriptions, testSubject)
+	requireUpstreamUnsubscribe(t, er, testSubject)
+}
+
+func TestRecheckKeepsSubscriptionsWhenTheServiceGivesNoAnswer(t *testing.T) {
+	fake := newFakeSubjectControl(t) // would answer DENY
+	useSubjectControl(t, fake)
+	er, _ := heldSubscriptions(t, testSubject, testAgentMrn)
+
+	for name, breakIt := range map[string]func(*fakeSubjectControl){
+		"503":          func(f *fakeSubjectControl) { f.decisionStatus = http.StatusServiceUnavailable },
+		"unreadable":   func(f *fakeSubjectControl) { f.decisionBody = `{"decision":` },
+		"unknown word": func(f *fakeSubjectControl) { f.decisionBody = `{"decision":"MAYBE"}` },
+	} {
+		fake.set(func(f *fakeSubjectControl) {
+			f.decisionStatus, f.decisionBody = http.StatusOK, `{"decision":"DENY"}`
+			breakIt(f)
+		})
+		er.recheckSubscriptions(context.Background())
+		require.Equal(t, 1, er.subscribers(testSubject), name)
+	}
+
+	fake.server.Close()
+	er.recheckSubscriptions(context.Background())
+	require.Equal(t, 1, er.subscribers(testSubject), "unreachable")
+	require.Empty(t, er.outgoingChannel)
+}
+
+func TestRecheckFollowsTheAllowlist(t *testing.T) {
+	fake := newFakeSubjectControl(t) // answers DENY to every decision
+	fake.set(func(f *fakeSubjectControl) {
+		f.allowlistBody, f.allowlistETag = `{"entries":[{"pattern":"urn:mrn:mcp:service:idp1:org1:.*","actions":["SUB"]}]}`, `"v1"`
+	})
+	useSubjectControl(t, fake)
+	er, _ := heldSubscriptions(t, testSubject, testAgentMrn)
+
+	er.recheckSubscriptions(context.Background())
+	require.Equal(t, 1, er.subscribers(testSubject), "on the allowlist")
+	require.Empty(t, fake.asked(), "an allowlisted subscription needs no decision")
+
+	// The entry is removed. After the next refresh the subscription depends on a decision, which is DENY.
+	fake.set(func(f *fakeSubjectControl) { f.allowlistBody, f.allowlistETag = `{"entries":[]}`, `"v2"` })
+	requireRefresh(t, subjectCtl, 10*time.Minute, true)
+	er.recheckSubscriptions(context.Background())
+	require.Equal(t, 0, er.subscribers(testSubject))
+	requireUpstreamUnsubscribe(t, er, testSubject)
+}
+
+func TestRecheckDropsAnonymousSubscriptionsMadeBeforeSubjectControl(t *testing.T) {
+	fake := newFakeSubjectControl(t)
+	fake.set(func(f *fakeSubjectControl) { f.decisionBody = `{"decision":"ALLOW"}` })
+	useSubjectControl(t, fake)
+	er, _ := heldSubscriptions(t, testSubject, "")
+
+	er.recheckSubscriptions(context.Background())
+	require.Equal(t, 0, er.subscribers(testSubject))
+	require.Empty(t, fake.asked())
+}
+
+func TestRecheckDoesNothingWithoutSubjectControl(t *testing.T) {
+	require.Nil(t, subjectCtl)
+	er, _ := heldSubscriptions(t, testSubject, "")
+	er.recheckSubscriptions(context.Background())
+	require.Equal(t, 1, er.subscribers(testSubject))
+}
+
+func TestSubscriptionsAreRecheckedAfterASuccessfulRefreshOnly(t *testing.T) {
+	run := func(sc *subjectControl) int {
+		ctx, cancel := context.WithCancel(context.Background())
+		wg := &sync.WaitGroup{}
+		rechecks := make(chan struct{}, 8)
+		wg.Add(1)
+		go sc.keepAllowlistFresh(ctx, wg, func(context.Context) { rechecks <- struct{}{} })
+		time.Sleep(300 * time.Millisecond)
+		cancel()
+		wg.Wait()
+		return len(rechecks)
+	}
+
+	fake := newFakeSubjectControl(t)
+	require.Equal(t, 1, run(fake.control()), "one refresh, one recheck")
+
+	down := newFakeSubjectControl(t)
+	sc := down.control()
+	down.server.Close()
+	require.Equal(t, 0, run(sc), "nothing can be learned while the service is down")
+}
+
+// A revoked permission ends a real subscription: the Agent subscribed over a connection, and after
+// the recheck a message published to the subject is no longer queued for it.
+func TestRevokedPermissionEndsAnExistingSubscription(t *testing.T) {
+	fake := newFakeSubjectControl(t)
+	fake.set(func(f *fakeSubjectControl) { f.decisionBody = `{"decision":"ALLOW"}` })
+	useSubjectControl(t, fake)
+	agent := openAuthenticatedAgentConnection(t, testAgentMrn)
+	require.Equal(t, mmtp.ResponseEnum_GOOD, agent.request(t, newSubscribeMessage(testSubject)))
+	require.NotNil(t, agent.forwarded())
+
+	er := &EdgeRouter{subscriptions: agent.subs, subMu: agent.subMu, store: agent.store, outgoingChannel: agent.receive}
+	fake.set(func(f *fakeSubjectControl) { f.decisionBody = `{"decision":"DENY"}` })
+	er.recheckSubscriptions(context.Background())
+
+	require.Equal(t, 0, er.subscribers(testSubject))
+	unsubscribe := agent.forwarded()
+	require.NotNil(t, unsubscribe)
+	require.Equal(t, mmtp.ProtocolMessageType_UNSUBSCRIBE_MESSAGE, unsubscribe.GetProtocolMessage().GetProtocolMsgType())
+
+	// Subscribing anew is refused as well, and the connection is still usable.
+	require.Equal(t, mmtp.ResponseEnum_ERROR, agent.request(t, newSubscribeMessage(testSubject)))
 }

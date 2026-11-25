@@ -40,11 +40,17 @@ import (
 //     Subscribe. Only a 200 answer saying ALLOW lets the request through; a denial, an error and
 //     an unreachable service all refuse it.
 //
+// Existing subscriptions are asked about again after every allowlist refresh, and dropped when the
+// service says DENY.
+//
 // The Agent only ever sees the standard MMTP GOOD or ERROR response.
 
 const (
 	actionPublish   = "PUB"
 	actionSubscribe = "SUB"
+
+	decisionAllow = "ALLOW"
+	decisionDeny  = "DENY"
 
 	// decisionTimeout bounds one decision request, so a slow service cannot stall an Agent's connection.
 	decisionTimeout = 3 * time.Second
@@ -110,40 +116,51 @@ func (sc *subjectControl) onAllowlist(subject, action string) bool {
 
 // decide asks the service. Anything but a 200 response saying ALLOW is a refusal.
 func (sc *subjectControl) decide(ctx context.Context, mrn, subject, action string) bool {
+	decision, err := sc.decision(ctx, mrn, subject, action)
+	if err != nil {
+		log.Warn("Subject control decision failed, refusing:", err)
+		return false
+	}
+	return decision == decisionAllow
+}
+
+// decision returns what the service answered. An error means it gave no answer, which is not a denial.
+func (sc *subjectControl) decision(ctx context.Context, mrn, subject, action string) (string, error) {
 	ctx, cancel := context.WithTimeout(ctx, decisionTimeout)
 	defer cancel()
 
 	query := url.Values{"mrn": {mrn}, "subject": {subject}, "action": {action}}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, sc.baseURL+"/v1/decision?"+query.Encode(), nil)
 	if err != nil {
-		log.Error("Could not create subject control decision request:", err)
-		return false
+		return "", err
 	}
 	resp, err := sc.client.Do(req)
 	if err != nil {
-		log.Warn("Subject control decision request failed, refusing:", err)
-		return false
+		return "", err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		log.Warnf("Subject control answered a decision request with %d, refusing", resp.StatusCode)
-		return false
+		return "", fmt.Errorf("status %d", resp.StatusCode)
 	}
 	var body struct {
 		Decision string `json:"decision"`
 	}
 	if err = json.NewDecoder(resp.Body).Decode(&body); err != nil {
-		log.Warn("Could not read subject control decision, refusing:", err)
-		return false
+		return "", err
 	}
-	return body.Decision == "ALLOW"
+	return body.Decision, nil
 }
 
 // keepAllowlistFresh fetches the allowlist now and again whenever it is due, until ctx ends.
-func (sc *subjectControl) keepAllowlistFresh(ctx context.Context, wg *sync.WaitGroup) {
+// After every successful fetch it calls afterRefresh, which is when existing subscriptions are
+// checked again. A failed fetch skips it: with the service down nothing could be learned.
+func (sc *subjectControl) keepAllowlistFresh(ctx context.Context, wg *sync.WaitGroup, afterRefresh func(context.Context)) {
 	defer wg.Done()
 	for {
-		wait := sc.refreshAllowlist(ctx)
+		wait, ok := sc.refreshAllowlist(ctx)
+		if ok && afterRefresh != nil {
+			afterRefresh(ctx)
+		}
 		select {
 		case <-ctx.Done():
 			return
@@ -152,17 +169,17 @@ func (sc *subjectControl) keepAllowlistFresh(ctx context.Context, wg *sync.WaitG
 	}
 }
 
-// refreshAllowlist asks for the allowlist once and returns how long to wait before asking again.
-// The kept list is replaced only by a 200 response. A 304 keeps it and extends its life. Any
-// failure leaves it as it is, to be used until validUntil.
-func (sc *subjectControl) refreshAllowlist(ctx context.Context) time.Duration {
+// refreshAllowlist asks for the allowlist once. It returns how long to wait before asking again and
+// whether the service answered. The kept list is replaced only by a 200 response. A 304 keeps it
+// and extends its life. Any failure leaves it as it is, to be used until validUntil.
+func (sc *subjectControl) refreshAllowlist(ctx context.Context) (time.Duration, bool) {
 	ctx, cancel := context.WithTimeout(ctx, decisionTimeout)
 	defer cancel()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, sc.baseURL+"/v1/allowlist", nil)
 	if err != nil {
 		log.Error("Could not create subject control allowlist request:", err)
-		return allowlistRetry
+		return allowlistRetry, false
 	}
 	sc.mu.RLock()
 	etag := sc.etag
@@ -173,7 +190,7 @@ func (sc *subjectControl) refreshAllowlist(ctx context.Context) time.Duration {
 	resp, err := sc.client.Do(req)
 	if err != nil {
 		log.Warn("Subject control allowlist request failed, keeping the current list:", err)
-		return allowlistRetry
+		return allowlistRetry, false
 	}
 	defer resp.Body.Close()
 
@@ -188,7 +205,7 @@ func (sc *subjectControl) refreshAllowlist(ctx context.Context) time.Duration {
 		}
 		if err = json.NewDecoder(resp.Body).Decode(&body); err != nil {
 			log.Warn("Could not read subject control allowlist, keeping the current list:", err)
-			return allowlistRetry
+			return allowlistRetry, false
 		}
 		entries := make([]allowEntry, 0, len(body.Entries))
 		for _, e := range body.Entries {
@@ -208,16 +225,92 @@ func (sc *subjectControl) refreshAllowlist(ctx context.Context) time.Duration {
 		sc.validUntil = sc.now().Add(maxAge + staleIfError)
 		sc.mu.Unlock()
 		log.Infof("Subject control allowlist updated, %d entries", len(entries))
-		return maxAge
+		return maxAge, true
 	case http.StatusNotModified:
 		sc.mu.Lock()
 		sc.validUntil = sc.now().Add(maxAge + staleIfError)
 		sc.mu.Unlock()
-		return maxAge
+		return maxAge, true
 	default:
 		log.Warnf("Subject control answered an allowlist request with %d, keeping the current list", resp.StatusCode)
-		return allowlistRetry
+		return allowlistRetry, false
 	}
+}
+
+// recheckSubscriptions drops the subject subscriptions the service no longer allows, so that a
+// permission that expired or was revoked stops the Agent from receiving, not only from subscribing anew.
+//
+// A subscription is dropped only on an explicit DENY. No answer keeps it: an outage of the service
+// must not unsubscribe everyone. The Agent is not told, as MMTP has no message for that.
+func (er *EdgeRouter) recheckSubscriptions(ctx context.Context) {
+	sc := subjectCtl
+	if sc == nil {
+		return
+	}
+	type held struct {
+		agent   *Agent
+		subject string
+	}
+	var subscriptions []held
+	er.subMu.RLock()
+	for subject, sub := range er.subscriptions {
+		for _, agent := range sub.SnapshotSubscribers() {
+			subscriptions = append(subscriptions, held{agent, subject})
+		}
+	}
+	er.subMu.RUnlock()
+
+	dropped := 0
+	for _, s := range subscriptions {
+		if ctx.Err() != nil {
+			return
+		}
+		// A subscription without an MRN was made anonymously, before subject control was switched on.
+		if s.agent.Mrn != "" {
+			if sc.onAllowlist(s.subject, actionSubscribe) {
+				continue
+			}
+			decision, err := sc.decision(ctx, s.agent.Mrn, s.subject, actionSubscribe)
+			if err != nil {
+				log.Warn("Could not recheck a subscription, keeping it:", err)
+				continue
+			}
+			if decision != decisionDeny {
+				continue
+			}
+		}
+		if err := er.dropSubscription(ctx, s.agent, s.subject); err != nil {
+			log.Error("Could not drop a subscription that is no longer allowed:", err)
+			continue
+		}
+		dropped++
+	}
+	if dropped > 0 {
+		log.Infof("Dropped %d subscriptions that subject control no longer allows", dropped)
+	}
+}
+
+// dropSubscription removes one Agent's subscription to a subject, and the Edge Router's own
+// subscription at the Router when that was the last Agent. The Agent's Interests are left alone:
+// they belong to the goroutine serving its connection and are only used to clean up on disconnect.
+func (er *EdgeRouter) dropSubscription(ctx context.Context, agent *Agent, subject string) error {
+	if err := er.store.Unsubscribe(ctx, agent.ID, subject); err != nil {
+		return err
+	}
+	unsubscribeUpstream := false
+	er.subMu.Lock()
+	if sub := er.subscriptions[subject]; sub != nil {
+		sub.DeleteSubscriber(agent)
+		if len(sub.SnapshotSubscribers()) == 0 {
+			delete(er.subscriptions, subject)
+			unsubscribeUpstream = true
+		}
+	}
+	er.subMu.Unlock()
+	if unsubscribeUpstream {
+		er.outgoingChannel <- newUpstreamSubscription(subject, false)
+	}
+	return nil
 }
 
 // checkSubjectControlFlags refuses flag combinations that could never work or would not be safe.

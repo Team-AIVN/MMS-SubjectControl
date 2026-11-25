@@ -124,8 +124,13 @@ Things to know:
 * `-subject-control` requires `-client-cert` and `-client-cert-key`, and cannot be combined with `-i`. The service's
   TLS certificate is verified against `-tlsca` (or the system CA store).
 * The Agent MRN is sent in lowercase, because the edgerouter lowercases it when the Agent connects.
-* The permission is checked when the Agent subscribes. A subscription that already exists is not checked again, so a
-  permission that is revoked later takes effect when the Agent's session ends or it subscribes anew.
+* A subscribe permission means the Agent may *be* subscribed, not only that it may subscribe. After every allowlist
+  refresh (every `max-age`, ten minutes by default) the edgerouter asks about each existing subject subscription again
+  and drops the ones the service denies. A revoked or expired permission therefore stops delivery within that interval.
+  Only an explicit `DENY` drops a subscription; while the service gives no answer, existing subscriptions stay.
+* An Agent is not told that its subscription was dropped, as MMTP has no message for it.
+* Subscriptions made anonymously before subject control was switched on are dropped at the first check.
+* The number of decision requests per refresh grows with the number of subscriptions that are not on the allowlist.
 
 #### Usage example
 

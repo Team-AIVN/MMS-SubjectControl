@@ -1610,7 +1610,7 @@ func runWithStderr(args []string, stderr io.Writer) error {
 	if *subjectControlURL != "" {
 		subjectCtl = newSubjectControl(*subjectControlURL, httpClient)
 		wg.Add(1)
-		go subjectCtl.keepAllowlistFresh(ctx, wg)
+		go subjectCtl.keepAllowlistFresh(ctx, wg, er.recheckSubscriptions)
 		log.Info("Subject control is on", "url", *subjectControlURL)
 	}
 
