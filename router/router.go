@@ -835,9 +835,11 @@ func handleIncomingMessages(ctx context.Context, router *MMSRouter, wg *sync.Wai
 								sub := router.subscriptions[subjectOrRecipient.Subject]
 								var ids []string
 								var store persistence.Store
-								for _, subscriber := range sub.Subscribers {
-									ids = append(ids, subscriber.ID)
-									store = subscriber.Store
+								if sub != nil {
+									for _, subscriber := range sub.Subscribers {
+										ids = append(ids, subscriber.ID)
+										store = subscriber.Store
+									}
 								}
 								router.subMu.RUnlock()
 								if err := consumer.QueueMessages(store, ids, incomingMessage); err != nil {
@@ -851,10 +853,12 @@ func handleIncomingMessages(ctx context.Context, router *MMSRouter, wg *sync.Wai
 								var store persistence.Store
 								for _, recipient := range subjectOrRecipient.Recipients.GetRecipients() {
 									router.subMu.RLock()
-									sub := router.subscriptions[recipient]
-									for _, er := range sub.Subscribers {
-										ids = append(ids, er.ID)
-										store = er.Store
+									// a multi-recipient message can name recipients that have no subscription on this router
+									if sub := router.subscriptions[recipient]; sub != nil {
+										for _, er := range sub.Subscribers {
+											ids = append(ids, er.ID)
+											store = er.Store
+										}
 									}
 									router.subMu.RUnlock()
 								}
