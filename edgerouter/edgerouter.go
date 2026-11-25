@@ -843,6 +843,10 @@ func handleSubscribeSubject(mmtpMessage *mmtp.MmtpMessage, agent *Agent, subMu *
 		errMsg.SendErrorMessage(mmtpMessage.GetUuid(), "Cannot subscribe to empty subject", request.Context(), c)
 		return nil
 	}
+	if !subjectCtl.allows(request.Context(), agent, subject, actionSubscribe) {
+		errMsg.SendErrorMessage(mmtpMessage.GetUuid(), "Not allowed to subscribe to this subject", request.Context(), c)
+		return nil
+	}
 	subMu.Lock()
 	sub, exists := subs[subject]
 	if !exists {
@@ -1055,8 +1059,14 @@ func handleSend(mmtpMessage *mmtp.MmtpMessage, outgoingChannel chan<- *mmtp.Mmtp
 			errMsg.SendErrorMessage(mmtpMessage.GetUuid(), "Subject string may not exceed 100 characters", request.Context(), c)
 			return
 		}
-		outgoingChannel <- mmtpMessage
 		header := send.GetApplicationMessage().GetHeader()
+		// Only subject-cast messages are subject to subject control; directly addressed ones are not.
+		if len(header.GetRecipients().GetRecipients()) == 0 && header.GetSubject() != "" &&
+			!subjectCtl.allows(request.Context(), agent, header.GetSubject(), actionPublish) {
+			errMsg.SendErrorMessage(mmtpMessage.GetUuid(), "Not allowed to publish to this subject", request.Context(), c)
+			return
+		}
+		outgoingChannel <- mmtpMessage
 		if len(header.GetRecipients().GetRecipients()) > 0 {
 			var ids []string
 			mrnToAgentMu.RLock()
@@ -1506,8 +1516,12 @@ func runWithStderr(args []string, stderr io.Writer) error {
 	healthPort := flagSet.Int("health-port", 8889, "The port number for the plaintext health check server.")
 	skipRevocationCheck := flagSet.Bool("skip-revocation-check", false, "Allow client certificates that do not have OCSP or CRL endpoints for revocation checking.")
 	databasePath := flagSet.String("db", "edgerouter.db", "Path to the SQLite persistence database. Set empty to disable persistence.")
+	subjectControlURL := flagSet.String("subject-control", "", "Base URL of a subject control service that decides who may publish or subscribe to a subject. If none is provided, every authenticated Agent may publish and anyone may subscribe.")
 
 	if err := flagSet.Parse(args); err != nil {
+		return err
+	}
+	if err := checkSubjectControlFlags(*subjectControlURL, *clientCertPath, *clientCertKeyPath, *insecure); err != nil {
 		return err
 	}
 
@@ -1591,6 +1605,13 @@ func runWithStderr(args []string, stderr io.Writer) error {
 	er, err := NewEdgeRouter(":"+strconv.Itoa(*listeningPort), ownMrn, outgoingChannel, routerWs, ctx, wg, clientCAs, routerAddr, httpClient, *geoLoc, *skipRevocationCheck, store)
 	if err != nil {
 		return fmt.Errorf("could not create MMS Edge Router instance: %w", err)
+	}
+
+	if *subjectControlURL != "" {
+		subjectCtl = newSubjectControl(*subjectControlURL, httpClient)
+		wg.Add(1)
+		go subjectCtl.keepAllowlistFresh(ctx, wg)
+		log.Info("Subject control is on", "url", *subjectControlURL)
 	}
 
 	wg.Add(1)

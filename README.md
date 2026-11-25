@@ -94,6 +94,39 @@ restrictions on the allowed operations.
 * `db` Path to the local SQLite persistence database. Defaults to `edgerouter.db`. Set to an empty string to disable
   persistence.
 
+* `subject-control` Base URL (https) of a subject control service. When set, the edgerouter asks the service whether an
+  Agent may publish or subscribe to a subject. See [Subject control](#subject-control). Not set by default.
+
+#### Subject control
+
+Without `-subject-control` the edgerouter behaves as before: every authenticated Agent may publish to any subject and
+anyone may subscribe to any subject.
+
+With `-subject-control https://<host>:<port>`:
+
+* A subject subscription and a subject-cast message are let through only when the service allows them. A denial, an
+  error and an unreachable service all refuse the request. The Agent receives the standard MMTP `ERROR` response.
+* Agents that connect without authenticating cannot subscribe to subjects.
+* Directly addressed messages (to recipient MRNs) and direct-message subscriptions are not affected.
+* The edgerouter keeps the service's allowlist of subject patterns in memory and refreshes it in the background.
+  A subject on the allowlist needs no request to the service. The last list received stays in use while the service is
+  unreachable, for as long as the service's `Cache-Control` allows (`max-age` + `stale-if-error`).
+
+The edgerouter calls two endpoints of the service, authenticating with its own MCP certificate (`-client-cert`):
+
+* `GET /v1/decision?mrn=<agent MRN>&subject=<subject>&action=PUB|SUB` &rarr; `200 {"decision":"ALLOW"}` lets the request
+  through. Anything else refuses it.
+* `GET /v1/allowlist` &rarr; `200 {"entries":[{"pattern":"<RE2 regular expression>","actions":["PUB","SUB"]}]}` with
+  `ETag` and `Cache-Control`. A pattern must match the whole subject.
+
+Things to know:
+
+* `-subject-control` requires `-client-cert` and `-client-cert-key`, and cannot be combined with `-i`. The service's
+  TLS certificate is verified against `-tlsca` (or the system CA store).
+* The Agent MRN is sent in lowercase, because the edgerouter lowercases it when the Agent connects.
+* The permission is checked when the Agent subscribes. A subscription that already exists is not checked again, so a
+  permission that is revoked later takes effect when the Agent's session ends or it subscribes anew.
+
 #### Usage example
 
 `./edgerouter -raddr "wss://127.0.0.1:8080" -port 7000 -client-cert cc.pem -client-cert-key ccpk.pem -cert-path tls.crt -cert-key-path tlspk.key -client-ca ca-chain.pem -mrn urn:mrn:mcp:device:mcc-test:testedgerouter -l "SWE"`
